@@ -108,7 +108,7 @@ function redirectToGoogle(
 	const url = new URL(
 		getUpstreamAuthorizeUrl({
 			clientId: env.GOOGLE_CLIENT_ID,
-			hostedDomain: env.HOSTED_DOMAIN,
+			hostedDomain: undefined,
 			redirectUri: new URL("/callback", request.url).href,
 			scope: YOUTUBE_SCOPES.join(" "),
 			state: stateToken,
