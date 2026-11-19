@@ -1,6 +1,10 @@
+
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { Hono } from "hono";
-import { fetchUpstreamAuthToken, getUpstreamAuthorizeUrl, type Props } from "./utils";
+import {
+	getUpstreamAuthorizeUrl,
+	type Props,
+} from "./utils";
 import {
 	addApprovedClient,
 	bindStateToSession,
@@ -15,32 +19,38 @@ import {
 
 const app = new Hono<{ Bindings: Env & { OAUTH_PROVIDER: OAuthHelpers } }>();
 
+const YOUTUBE_SCOPES = [
+	"email",
+	"profile",
+	"https://www.googleapis.com/auth/yt-analytics.readonly",
+	"https://www.googleapis.com/auth/youtube.readonly",
+];
+
 app.get("/authorize", async (c) => {
 	const oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
 	const { clientId } = oauthReqInfo;
+
 	if (!clientId) {
 		return c.text("Invalid request", 400);
 	}
 
-	// Check if client is already approved
 	if (await isClientApproved(c.req.raw, clientId, c.env.COOKIE_ENCRYPTION_KEY)) {
-		// Skip approval dialog but still create secure state and bind to session
 		const { stateToken } = await createOAuthState(oauthReqInfo, c.env.OAUTH_KV);
-		const { setCookie: sessionBindingCookie } = await bindStateToSession(stateToken);
+		const { setCookie } = await bindStateToSession(stateToken);
+
 		return redirectToGoogle(c.req.raw, c.env, stateToken, {
-			"Set-Cookie": sessionBindingCookie,
+			"Set-Cookie": setCookie,
 		});
 	}
 
-	// Generate CSRF protection for the approval form
 	const { token: csrfToken, setCookie } = generateCSRFProtection();
 
 	return renderApprovalDialog(c.req.raw, {
 		client: await c.env.OAUTH_PROVIDER.lookupClient(clientId),
 		csrfToken,
 		server: {
-			description: "This MCP Server is a demo for Google OAuth.",
-			name: "Google OAuth Demo",
+			description: "Read-only YouTube Analytics and channel information.",
+			name: "Silent Patterns YouTube MCP",
 		},
 		setCookie,
 		state: { oauthReqInfo },
@@ -49,53 +59,56 @@ app.get("/authorize", async (c) => {
 
 app.post("/authorize", async (c) => {
 	try {
-		// Read form data once
 		const formData = await c.req.raw.formData();
-
-		// Validate CSRF token
 		validateCSRFToken(formData, c.req.raw);
 
-		// Extract state from form data
 		const encodedState = formData.get("state");
+
 		if (!encodedState || typeof encodedState !== "string") {
 			return c.text("Missing state in form data", 400);
 		}
 
 		let state: { oauthReqInfo?: AuthRequest };
+
 		try {
 			state = JSON.parse(atob(encodedState));
-		} catch (_e) {
+		} catch {
 			return c.text("Invalid state data", 400);
 		}
 
-		if (!state.oauthReqInfo || !state.oauthReqInfo.clientId) {
+		if (!state.oauthReqInfo?.clientId) {
 			return c.text("Invalid request", 400);
 		}
 
-		// Add client to approved list
 		const approvedClientCookie = await addApprovedClient(
 			c.req.raw,
 			state.oauthReqInfo.clientId,
 			c.env.COOKIE_ENCRYPTION_KEY,
 		);
 
-		// Create OAuth state and bind it to this user's session
-		const { stateToken } = await createOAuthState(state.oauthReqInfo, c.env.OAUTH_KV);
-		const { setCookie: sessionBindingCookie } = await bindStateToSession(stateToken);
+		const { stateToken } = await createOAuthState(
+			state.oauthReqInfo,
+			c.env.OAUTH_KV,
+		);
 
-		// Set both cookies: approved client list + session binding
+		const { setCookie: sessionBindingCookie } =
+			await bindStateToSession(stateToken);
+
 		const headers = new Headers();
 		headers.append("Set-Cookie", approvedClientCookie);
 		headers.append("Set-Cookie", sessionBindingCookie);
 
-		return redirectToGoogle(c.req.raw, c.env, stateToken, Object.fromEntries(headers));
+		return redirectToGoogle(c.req.raw, c.env, stateToken, {
+			"Set-Cookie": headers.get("Set-Cookie") ?? "",
+		});
 	} catch (error: any) {
 		console.error("POST /authorize error:", error);
+
 		if (error instanceof OAuthError) {
 			return error.toResponse();
 		}
-		// Unexpected non-OAuth error
-		return c.text(`Internal server error: ${error.message}`, 500);
+
+		return c.text("Internal server error", 500);
 	}
 });
 
@@ -105,41 +118,30 @@ async function redirectToGoogle(
 	stateToken: string,
 	headers: Record<string, string> = {},
 ) {
+	const url = new URL(
+		getUpstreamAuthorizeUrl({
+			clientId: env.GOOGLE_CLIENT_ID,
+			hostedDomain: env.HOSTED_DOMAIN,
+			redirectUri: new URL("/callback", request.url).href,
+			scope: YOUTUBE_SCOPES.join(" "),
+			state: stateToken,
+			upstreamUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+		}),
+	);
+
+	url.searchParams.set("access_type", "offline");
+	url.searchParams.set("prompt", "consent");
+
 	return new Response(null, {
 		headers: {
 			...headers,
-			location: getUpstreamAuthorizeUrl({
-				clientId: env.GOOGLE_CLIENT_ID,
-				hostedDomain: env.HOSTED_DOMAIN,
-				redirectUri: new URL("/callback", request.url).href,
-				scope: "email profile",
-				state: stateToken,
-				upstreamUrl: "https://accounts.google.com/o/oauth2/v2/auth",
-			}),
+			location: url.href,
 		},
 		status: 302,
 	});
 }
 
-/**
- * OAuth Callback Endpoint
- *
- * This route handles the callback from Google after user authentication.
- * It exchanges the temporary code for an access token, then stores some
- * user metadata & the auth token as part of the 'props' on the token passed
- * down to the client. It ends by redirecting the client back to _its_ callback URL
- *
- * SECURITY: This endpoint validates that the state parameter from Google
- * matches both:
- * 1. A valid state token in KV (proves it was created by our server)
- * 2. The __Host-CONSENTED_STATE cookie (proves THIS browser consented to it)
- *
- * This prevents CSRF attacks where an attacker's state token is injected
- * into a victim's OAuth flow.
- */
 app.get("/callback", async (c) => {
-	// Validate OAuth state with session binding
-	// This checks both KV storage AND the session cookie
 	let oauthReqInfo: AuthRequest;
 	let clearSessionCookie: string;
 
@@ -151,7 +153,7 @@ app.get("/callback", async (c) => {
 		if (error instanceof OAuthError) {
 			return error.toResponse();
 		}
-		// Unexpected non-OAuth error
+
 		return c.text("Internal server error", 500);
 	}
 
@@ -159,57 +161,90 @@ app.get("/callback", async (c) => {
 		return c.text("Invalid OAuth request data", 400);
 	}
 
-	// Exchange the code for an access token
 	const code = c.req.query("code");
+
 	if (!code) {
 		return c.text("Missing code", 400);
 	}
 
-	const [accessToken, googleErrResponse] = await fetchUpstreamAuthToken({
-		clientId: c.env.GOOGLE_CLIENT_ID,
-		clientSecret: c.env.GOOGLE_CLIENT_SECRET,
-		code,
-		grantType: "authorization_code",
-		redirectUri: new URL("/callback", c.req.url).href,
-		upstreamUrl: "https://accounts.google.com/o/oauth2/token",
-	});
-	if (googleErrResponse) {
-		return googleErrResponse;
-	}
+	const redirectUri = new URL("/callback", c.req.url).href;
 
-	// Fetch the user info from Google
-	const userResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-		headers: {
-			Authorization: `Bearer ${accessToken}`,
+	const tokenResponse = await fetch(
+		"https://oauth2.googleapis.com/token",
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+			body: new URLSearchParams({
+				client_id: c.env.GOOGLE_CLIENT_ID,
+				client_secret: c.env.GOOGLE_CLIENT_SECRET,
+				code,
+				grant_type: "authorization_code",
+				redirect_uri: redirectUri,
+			}),
 		},
-	});
-	if (!userResponse.ok) {
-		return c.text(`Failed to fetch user info: ${await userResponse.text()}`, 500);
+	);
+
+	if (!tokenResponse.ok) {
+		console.error("Google token exchange failed:", await tokenResponse.text());
+		return c.text("Failed to obtain Google access token", 500);
 	}
 
-	const { id, name, email } = (await userResponse.json()) as {
+	const tokens = await tokenResponse.json() as {
+		access_token?: string;
+		refresh_token?: string;
+	};
+
+	if (!tokens.access_token) {
+		return c.text("Google did not return an access token", 500);
+	}
+
+	if (!tokens.refresh_token) {
+		return c.text(
+			"Google did not return a refresh token. Revoke previous app access and authorize again.",
+			400,
+		);
+	}
+
+	const userResponse = await fetch(
+		"https://www.googleapis.com/oauth2/v2/userinfo",
+		{
+			headers: {
+				Authorization: `Bearer ${tokens.access_token}`,
+			},
+		},
+	);
+
+	if (!userResponse.ok) {
+		return c.text("Failed to fetch Google user information", 500);
+	}
+
+	const user = await userResponse.json() as {
 		id: string;
 		name: string;
 		email: string;
 	};
 
-	// Return back to the MCP client a new token
+	const props: Props = {
+		accessToken: tokens.access_token,
+		refreshToken: tokens.refresh_token,
+		email: user.email,
+		name: user.name,
+	};
+
 	const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
 		metadata: {
-			label: name,
+			label: user.name,
 		},
-		props: {
-			accessToken,
-			email,
-			name,
-		} as Props,
+		props,
 		request: oauthReqInfo,
 		scope: oauthReqInfo.scope,
-		userId: id,
+		userId: user.id,
 	});
 
-	// Clear the session binding cookie (one-time use) by creating response with headers
 	const headers = new Headers({ Location: redirectTo });
+
 	if (clearSessionCookie) {
 		headers.set("Set-Cookie", clearSessionCookie);
 	}
