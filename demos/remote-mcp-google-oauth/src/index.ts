@@ -83,19 +83,59 @@ function createServer() {
           throw new Error("No YouTube channel was found for this Google account.");
         }
 
+        
+        const headers = data.columnHeaders?.map((header: { name?: string }) => header.name) ?? [];
+        const videoIdIndex = headers.indexOf("video");
+        const rows = data.rows ?? [];
+        const videoIds = [...new Set(
+          rows.map((row: any[]) => row[videoIdIndex]).filter((id: unknown): id is string => typeof id === "string")
+        )];
+
+        let metadataById = new Map<string, any>();
+        let metadataError: string | undefined;
+
+        if (videoIds.length > 0) {
+          try {
+            const metadata = await googleGet(
+              `${YOUTUBE_API}/videos?part=snippet,contentDetails&id=${videoIds.join(",")}`,
+              accessToken
+            );
+            metadataById = new Map(
+              (metadata.items ?? []).map((video: any) => [video.id, video])
+            );
+          } catch (error) {
+            metadataError = String(error);
+          }
+        }
+
+        const videos = rows.map((row: any[]) => {
+          const analytics: Record<string, unknown> = {};
+          headers.forEach((header: string, index: number) => {
+            analytics[header] = row[index];
+          });
+
+          const videoId = String(analytics.video ?? "");
+          const video = metadataById.get(videoId);
+          return {
+            videoId,
+            title: video?.snippet?.title,
+            publishedAt: video?.snippet?.publishedAt,
+            duration: video?.contentDetails?.duration,
+            description: video?.snippet?.description,
+            tags: video?.snippet?.tags ?? [],
+            views: analytics.views,
+            estimatedMinutesWatched: analytics.estimatedMinutesWatched,
+            averageViewDuration: analytics.averageViewDuration,
+          };
+        });
+
         return {
           content: [{
             type: "text",
-            text: JSON.stringify({
-              channelName: channel.snippet?.title,
-              channelId: channel.id,
-              subscribers: channel.statistics?.subscriberCount,
-              totalViews: channel.statistics?.viewCount,
-              videoCount: channel.statistics?.videoCount,
-              hiddenSubscriberCount: channel.statistics?.hiddenSubscriberCount,
-            }, null, 2),
+            text: JSON.stringify({ videos, metadataError }, null, 2),
           }],
         };
+
       } catch (error) {
         return {
           isError: true,
