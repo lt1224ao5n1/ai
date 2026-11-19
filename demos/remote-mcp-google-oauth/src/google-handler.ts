@@ -1,10 +1,7 @@
 
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { Hono } from "hono";
-import {
-	getUpstreamAuthorizeUrl,
-	type Props,
-} from "./utils";
+import { getUpstreamAuthorizeUrl, type Props } from "./utils";
 import {
 	addApprovedClient,
 	bindStateToSession,
@@ -30,17 +27,15 @@ app.get("/authorize", async (c) => {
 	const oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
 	const { clientId } = oauthReqInfo;
 
-	if (!clientId) {
-		return c.text("Invalid request", 400);
-	}
+	if (!clientId) return c.text("Invalid request", 400);
 
 	if (await isClientApproved(c.req.raw, clientId, c.env.COOKIE_ENCRYPTION_KEY)) {
 		const { stateToken } = await createOAuthState(oauthReqInfo, c.env.OAUTH_KV);
 		const { setCookie } = await bindStateToSession(stateToken);
+		const headers = new Headers();
+		headers.append("Set-Cookie", setCookie);
 
-		return redirectToGoogle(c.req.raw, c.env, stateToken, {
-			"Set-Cookie": setCookie,
-		});
+		return redirectToGoogle(c.req.raw, c.env, stateToken, headers);
 	}
 
 	const { token: csrfToken, setCookie } = generateCSRFProtection();
@@ -63,13 +58,11 @@ app.post("/authorize", async (c) => {
 		validateCSRFToken(formData, c.req.raw);
 
 		const encodedState = formData.get("state");
-
 		if (!encodedState || typeof encodedState !== "string") {
 			return c.text("Missing state in form data", 400);
 		}
 
 		let state: { oauthReqInfo?: AuthRequest };
-
 		try {
 			state = JSON.parse(atob(encodedState));
 		} catch {
@@ -98,25 +91,19 @@ app.post("/authorize", async (c) => {
 		headers.append("Set-Cookie", approvedClientCookie);
 		headers.append("Set-Cookie", sessionBindingCookie);
 
-		return redirectToGoogle(c.req.raw, c.env, stateToken, {
-			"Set-Cookie": headers.get("Set-Cookie") ?? "",
-		});
-	} catch (error: any) {
+		return redirectToGoogle(c.req.raw, c.env, stateToken, headers);
+	} catch (error: unknown) {
 		console.error("POST /authorize error:", error);
-
-		if (error instanceof OAuthError) {
-			return error.toResponse();
-		}
-
+		if (error instanceof OAuthError) return error.toResponse();
 		return c.text("Internal server error", 500);
 	}
 });
 
-async function redirectToGoogle(
+function redirectToGoogle(
 	request: Request,
 	env: Env,
 	stateToken: string,
-	headers: Record<string, string> = {},
+	extraHeaders: HeadersInit = {},
 ) {
 	const url = new URL(
 		getUpstreamAuthorizeUrl({
@@ -132,13 +119,10 @@ async function redirectToGoogle(
 	url.searchParams.set("access_type", "offline");
 	url.searchParams.set("prompt", "consent");
 
-	return new Response(null, {
-		headers: {
-			...headers,
-			location: url.href,
-		},
-		status: 302,
-	});
+	const headers = new Headers(extraHeaders);
+	headers.set("Location", url.href);
+
+	return new Response(null, { status: 302, headers });
 }
 
 app.get("/callback", async (c) => {
@@ -149,11 +133,8 @@ app.get("/callback", async (c) => {
 		const result = await validateOAuthState(c.req.raw, c.env.OAUTH_KV);
 		oauthReqInfo = result.oauthReqInfo;
 		clearSessionCookie = result.clearCookie;
-	} catch (error: any) {
-		if (error instanceof OAuthError) {
-			return error.toResponse();
-		}
-
+	} catch (error: unknown) {
+		if (error instanceof OAuthError) return error.toResponse();
 		return c.text("Internal server error", 500);
 	}
 
@@ -161,30 +142,27 @@ app.get("/callback", async (c) => {
 		return c.text("Invalid OAuth request data", 400);
 	}
 
-	const code = c.req.query("code");
-
-	if (!code) {
-		return c.text("Missing code", 400);
+	const googleError = c.req.query("error");
+	if (googleError) {
+		return c.text(`Google authorization failed: ${googleError}`, 400);
 	}
+
+	const code = c.req.query("code");
+	if (!code) return c.text("Missing code", 400);
 
 	const redirectUri = new URL("/callback", c.req.url).href;
 
-	const tokenResponse = await fetch(
-		"https://oauth2.googleapis.com/token",
-		{
-			method: "POST",
-			headers: {
-				"Content-Type": "application/x-www-form-urlencoded",
-			},
-			body: new URLSearchParams({
-				client_id: c.env.GOOGLE_CLIENT_ID,
-				client_secret: c.env.GOOGLE_CLIENT_SECRET,
-				code,
-				grant_type: "authorization_code",
-				redirect_uri: redirectUri,
-			}),
-		},
-	);
+	const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			client_id: c.env.GOOGLE_CLIENT_ID,
+			client_secret: c.env.GOOGLE_CLIENT_SECRET,
+			code,
+			grant_type: "authorization_code",
+			redirect_uri: redirectUri,
+		}),
+	});
 
 	if (!tokenResponse.ok) {
 		console.error("Google token exchange failed:", await tokenResponse.text());
@@ -196,13 +174,9 @@ app.get("/callback", async (c) => {
 		refresh_token?: string;
 	};
 
-	if (!tokens.access_token) {
-		return c.text("Google did not return an access token", 500);
-	}
-
-	if (!tokens.refresh_token) {
+	if (!tokens.access_token || !tokens.refresh_token) {
 		return c.text(
-			"Google did not return a refresh token. Revoke previous app access and authorize again.",
+			"Google did not return both required tokens. Revoke the previous app grant and authorize again.",
 			400,
 		);
 	}
@@ -210,9 +184,7 @@ app.get("/callback", async (c) => {
 	const userResponse = await fetch(
 		"https://www.googleapis.com/oauth2/v2/userinfo",
 		{
-			headers: {
-				Authorization: `Bearer ${tokens.access_token}`,
-			},
+			headers: { Authorization: `Bearer ${tokens.access_token}` },
 		},
 	);
 
@@ -234,9 +206,7 @@ app.get("/callback", async (c) => {
 	};
 
 	const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
-		metadata: {
-			label: user.name,
-		},
+		metadata: { label: user.name },
 		props,
 		request: oauthReqInfo,
 		scope: oauthReqInfo.scope,
@@ -244,15 +214,11 @@ app.get("/callback", async (c) => {
 	});
 
 	const headers = new Headers({ Location: redirectTo });
-
 	if (clearSessionCookie) {
-		headers.set("Set-Cookie", clearSessionCookie);
+		headers.append("Set-Cookie", clearSessionCookie);
 	}
 
-	return new Response(null, {
-		status: 302,
-		headers,
-	});
+	return new Response(null, { status: 302, headers });
 });
 
 export { app as GoogleHandler };
