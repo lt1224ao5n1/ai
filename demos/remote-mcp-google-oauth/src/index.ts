@@ -1,30 +1,50 @@
+
 import { env } from "cloudflare:workers";
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/server";
-import { createMcpHandler } from "agents/mcp/server";
+import { createMcpHandler, getMcpAuthContext } from "agents/mcp/server";
 import { z } from "zod";
 import { GoogleHandler } from "./google-handler";
 
-// Context from the auth process, encrypted and stored in the auth token.
-// Read it inside the server with `getMcpAuthContext()?.props`.
 export type Props = {
 	name: string;
 	email: string;
 	accessToken: string;
+	refreshToken: string;
 };
 
 function createServer() {
 	const server = new McpServer({
-		name: "Google OAuth Proxy Demo",
-		version: "0.0.1",
+		name: "Silent Patterns YouTube Analytics",
+		version: "1.0.0",
 	});
 
 	server.registerTool(
-		"add",
-		{ inputSchema: z.object({ a: z.number(), b: z.number() }) },
-		async ({ a, b }) => ({
-			content: [{ text: String(a + b), type: "text" }],
-		}),
+		"who_am_i",
+		{
+			description: "Returns the Google account authenticated with this server.",
+			inputSchema: z.object({}),
+		},
+		async () => {
+			const props = getMcpAuthContext()?.props as Props | undefined;
+
+			if (!props) {
+				return {
+					isError: true,
+					content: [{ type: "text", text: "Google authentication is missing." }],
+				};
+			}
+
+			return {
+				content: [{
+					type: "text",
+					text: JSON.stringify({
+						name: props.name,
+						email: props.email,
+					}),
+				}],
+			};
+		},
 	);
 
 	return server;
@@ -43,6 +63,5 @@ export default new OAuthProvider<Env>({
 	clientRegistrationEndpoint: "/register",
 	defaultHandler: GoogleHandler as any,
 	tokenEndpoint: "/token",
-	// The URL MCP clients connect to. Every token is bound to it.
 	resourceMetadata: { resource: env.MCP_RESOURCE },
 });
