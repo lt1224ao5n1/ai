@@ -1,14 +1,6 @@
+
 /**
  * Constructs an authorization URL for an upstream service.
- *
- * @param {Object} options
- * @param {string} options.upstream_url - The base URL of the upstream service.
- * @param {string} options.client_id - The client ID of the application.
- * @param {string} options.redirect_uri - The redirect URI of the application.
- * @param {string} [options.state] - The state parameter.
- * @param {string} [options.hosted_domain] - The hosted domain parameter.
- *
- * @returns {string} The authorization URL.
  */
 export function getUpstreamAuthorizeUrl({
 	upstreamUrl,
@@ -37,16 +29,6 @@ export function getUpstreamAuthorizeUrl({
 
 /**
  * Fetches an authorization token from an upstream service.
- *
- * @param {Object} options
- * @param {string} options.client_id - The client ID of the application.
- * @param {string} options.client_secret - The client secret of the application.
- * @param {string} options.code - The authorization code.
- * @param {string} options.redirect_uri - The redirect URI of the application.
- * @param {string} options.upstream_url - The token endpoint URL of the upstream service.
- * @param {string} options.grant_type - The grant type.
- *
- * @returns {Promise<[string, null] | [null, Response]>} A promise that resolves to an array containing the access token or an error response.
  */
 export async function fetchUpstreamAuthToken({
 	clientId,
@@ -80,6 +62,7 @@ export async function fetchUpstreamAuthToken({
 		},
 		method: "POST",
 	});
+
 	if (!resp.ok) {
 		console.log(await resp.text());
 		return [null, new Response("Failed to fetch access token", { status: 500 })];
@@ -87,12 +70,15 @@ export async function fetchUpstreamAuthToken({
 
 	interface authTokenResponse {
 		access_token: string;
+		refresh_token?: string;
 	}
 
 	const body = (await resp.json()) as authTokenResponse;
+
 	if (!body.access_token) {
 		return [null, new Response("Missing access token", { status: 400 })];
 	}
+
 	return [body.access_token, null];
 }
 
@@ -102,4 +88,5 @@ export type Props = {
 	name: string;
 	email: string;
 	accessToken: string;
+	refreshToken: string;
 };
